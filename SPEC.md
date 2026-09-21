@@ -1231,3 +1231,148 @@ Sin suite automatizada — `npx tsc --noEmit` + `npm run build` + QA manual con 
 ## Open Questions
 
 Ninguna.
+
+---
+
+# Spec: Reporte mensual "Info para invoicing" (Recurso × Proyecto)
+
+## Objective
+
+Todos los meses el usuario arma a mano una hoja de cálculo "Info para invoicing": una tabla pivot
+con una fila por persona, una columna por proyecto, y las horas cargadas ese mes en cada celda, más
+una columna "Total Horas" por fila. Quiere que ZirconTracker genere ese mismo contenido
+automáticamente para no tener que armarlo a mano cada mes.
+
+**Éxito** = desde una pantalla de ZirconTracker, elegir un mes y descargar un archivo `.xlsx` con
+esa tabla ya armada — mismas horas que hoy carga a mano, en el mismo formato de pivot — para
+pegar/subir directo a su Google Sheet.
+
+## Hallazgos clave de la exploración (contra la imagen adjunta)
+
+- **12 de 14 columnas de proyecto matchean exacto** contra `Project.name` en la base. "IMOUY (EG+)"
+  y "Bench (Internal Issues)" son, a juzgar por el paréntesis, nombres viejos de los proyectos
+  actuales "EG+" e "Internal Issues".
+- **"SCC-Congroup" no existe como `Project`** en la base (igual tiene 64hs cargadas a un recurso en
+  la imagen). El usuario confirmó que no lo va a crear como proyecto real.
+- Los nombres de la columna "Recurso" en la planilla vieja no coinciden literalmente con
+  `Resource.name` actual, pero casi todos resuelven a un recurso real una vez que se tiene en cuenta
+  que varios fueron renombrados en la base durante esta misma sesión (ver tabla de mapeo abajo):
+  `EDUARDO NOGUEIRA` → `Eduardo Nogueira Vicentini`, `AVNER NAHUM` → `AVNER Santos`, `lgutierrez` →
+  `Luz Gutierrez`, `Facundo Wade Jacobs (fwade)` → `Facundo Wade`. El resto son alias/abreviaturas
+  sin cambio en la base: `Bsilva` → `Betzabe Silva`, `Yan - Kreitech` → `Yan` (el otro recurso
+  "Yan", distinto de "Kevin Yan" que ya está aparte en la lista), `Luciana Diniz Gonçalves dos
+  Santos` → `Luciana Diniz`, `Victor Córdoba` → `Victor Cordoba`.
+- **"Nicolas Daneri" no existe como `Resource`** en la base — es el único nombre de la lista que no
+  resuelve a ningún recurso real.
+- **"Total Horas" = suma de todas las columnas de esa fila** (verificado con la imagen: Abdulelah
+  Ragih tiene 0.30 + 167.70 = 168.00, coincide exacto). No hay distinción de "horas facturables" —
+  es la suma de todo lo cargado ese mes, sin importar proyecto.
+
+## Decisiones confirmadas con el usuario
+
+1. **Entrega**: pantalla en ZirconTracker con un selector de mes, un botón para generar una
+   **previsualización**, y desde ahí descargar el `.xlsx` final — no hay push automático a un
+   Google Sheet (eso requeriría autorizar un conector de Google que hoy no está conectado en esta
+   sesión).
+2. **Orden de filas y columnas: fijo, no derivado de la base.** El usuario dio el orden exacto de
+   ambos ejes y tiene que respetarse tal cual, mes a mes:
+   - **Proyectos (columnas), en este orden**: SCC-Congroup, Breinchild, IMOUY (EG+), Ideal Protein,
+     Bench (Internal Issues), MOB Mantenimiento, SCC-Holcim, SmartWay, StarCenter, Suku 2024,
+     Infogain, AI Assessments, Claldy, HubID-Guardian.
+   - **Recursos (filas), en este orden**: Raul Velazquez, Abdulelah Ragih, AVNER NAHUM, Bruno
+     Rodrigues Lopes, Bsilva, Claudio Uslenghi, EDUARDO NOGUEIRA, Facundo Wade Jacobs (fwade),
+     Gonzalo Torterolo, Kevin Yan, lgutierrez, PABLO RAPPALINI, Rafael Basile, rgomez, RICARDO
+     AMARANTE, Will Olivera, Yan - Kreitech, Luciana Diniz Gonçalves dos Santos, Victor Córdoba,
+     Nicolas Daneri, Nelson Toledo.
+   - Cada nombre de esta lista fija se resuelve a un `Resource`/`Project` real vía el mapeo de
+     Hallazgos de arriba (match exacto donde coincide, alias hardcodeado donde no) — el texto que
+     se muestra en el archivo final es el `Resource.name`/`Project.name` **actual** de la base, no
+     la etiqueta vieja de la lista (la lista fija es solo la llave de orden + búsqueda).
+3. **Avisos + previsualización cuando una persona/proyecto no tuvo horas ese mes, o no existe en la
+   base**: el sistema NO los descarta en silencio. Se muestran en una previsualización con un aviso
+   claro, y el usuario decide por checkbox si esa fila/columna va igual (en 0) o se excluye del
+   archivo final para ese mes. Esto cubre tanto el caso "existe pero no cargó horas este mes" como
+   el caso "no existe en la base" (`Nicolas Daneri`, `SCC-Congroup` hoy) — para estos últimos la
+   previsualización simplemente no tiene de dónde sacar un total, pero igual se listan en el aviso
+   para que quede claro que faltan, en vez de desaparecer sin explicación.
+4. **Nombres mostrados**: `Resource.name` y `Project.name` actuales de la base (no los alias viejos
+   de la lista fija, que solo sirven para el orden/búsqueda — ver punto 2).
+
+## Tech Stack
+
+Next.js 14 App Router, TypeScript, Prisma + Turso, librería `xlsx` (SheetJS) — ya es dependencia
+del proyecto (usada por el import de SCC) — para generar el `.xlsx`.
+
+## Project Structure
+
+- `lib/invoicing-report.ts` (nuevo) — las dos listas fijas ordenadas (`INVOICING_PROJECT_ORDER`,
+  `INVOICING_RESOURCE_ORDER`) como arrays de `{ label: string; lookupNames: string[] }` (`label` =
+  el texto de la lista vieja, solo para referencia/debug; `lookupNames` = uno o más
+  `Resource.name`/`Project.name` candidatos a matchear, case-insensitive, para cubrir los alias ya
+  identificados — p.ej. `Bsilva` → `lookupNames: ['Betzabe Silva']`). Función pura
+  `resolveInvoicingOrder(order, dbNames)` que, dado el array fijo y los nombres reales existentes en
+  la base, devuelve para cada entrada `{ label, resolvedName: string | null }` (`null` = no existe
+  ningún recurso/proyecto con ese nombre hoy).
+- `app/api/reports/invoicing/route.ts` (nuevo) — `GET` con `?month=YYYY-MM`, admin-only
+  (`requireAdmin`). Resuelve ambas listas fijas contra `Resource`/`Project` reales, hace
+  `prisma.timeEntry.groupBy({ by: ['resourceId','projectId'], where: { date: {gte, lte} }, _sum: {
+  hours: true } })` (mismo patrón que el `groupBy` de "Horas por tarea" ya usado en
+  `/api/time-entries`/`/api/me/time-entries`), arma la matriz completa en el orden fijo, y devuelve
+  JSON: `{ projects: [{label, resolvedName, hasData}], resources: [{label, resolvedName, hasData,
+  total, hoursByProject}], warnings: string[] }` — no genera el `.xlsx` todavía, eso es un segundo
+  paso una vez confirmada la previsualización.
+- `app/api/reports/invoicing/export/route.ts` (nuevo) — `POST`, admin-only, recibe `{ month,
+  includeProjects: string[], includeResources: string[] }` (las filas/columnas que el usuario
+  confirmó incluir tras ver los avisos) y devuelve el `.xlsx` como buffer binario con
+  `Content-Disposition: attachment`.
+- Componente nuevo (p.ej. `components/modals/InvoicingReportModal.tsx` o una sección en
+  `/admin/hours`) con: selector de mes → "Generar previsualización" → tabla de preview + bloque de
+  avisos (mismo patrón visual que `VacationCsvImportModal`: caja ámbar con `AlertTriangle`, un
+  checkbox por fila/columna con aviso para incluir/excluir) → botón "Descargar .xlsx" que llama al
+  endpoint de export con la selección confirmada.
+
+## Code Style
+
+Reutilizar el patrón de `groupBy` + pivot en memoria ya usado en las rutas `by-task` de
+`/api/time-entries`/`/api/me/time-entries`, y el patrón de preview-con-avisos-y-checkboxes ya usado
+en `VacationCsvImportModal` (componentes/modals/VacationCsvImportModal.tsx) para la resolución
+manual de filas problemáticas.
+
+## Testing Strategy
+
+Sin suite automatizada — `npx tsc --noEmit` + `npm run build` + QA manual con datos de prueba
+descartables:
+- Mes con horas de prueba para varios recursos/proyectos de la lista fija → preview muestra la
+  matriz completa en el orden fijo correcto, con los nombres actuales de la base.
+- Un recurso/proyecto de la lista fija sin horas ese mes (pero que sí existe en la base) → aparece
+  en los avisos, con checkbox; si se destilda, no sale en el `.xlsx` final.
+- `Nicolas Daneri` / `SCC-Congroup` (no existen en la base) → aparecen en los avisos explicando que
+  no se encontró el recurso/proyecto, sin romper el resto de la previsualización.
+- El `.xlsx` descargado respeta el orden fijo de columnas y filas, y el contenido de las celdas
+  coincide con los totales ya mostrados en Reporte de Horas para el mismo mes.
+
+## Boundaries
+
+- **Always**: no crear "SCC-Congroup" ni "Nicolas Daneri" como registros reales — solo reportarlos
+  como aviso en la previsualización. Nunca inventar un valor de horas para algo que no está en la
+  base.
+- **Ask first**: si en algún momento se quiere agregar push automático a Google Sheets (necesita
+  autorizar un conector de Google primero), o si el orden fijo de personas/proyectos cambia y hay
+  que actualizar `lib/invoicing-report.ts`.
+- **Never**: modificar `buildTimeEntriesPivot` ni las vistas existentes de Reporte de Horas/Reporte
+  Diario/Mi Reporte — este es un flujo nuevo e independiente.
+
+## Success Criteria
+
+1. La previsualización muestra la matriz completa en el orden fijo exacto dado por el usuario, con
+   los nombres actuales de la base.
+2. Toda fila/columna de la lista fija sin horas ese mes, o sin match en la base, aparece como aviso
+   explícito con opción de incluir/excluir — nunca desaparece en silencio.
+3. El `.xlsx` descargado refleja exactamente lo que el usuario confirmó en la previsualización, con
+   los mismos totales que Reporte de Horas para ese mes.
+4. `npx tsc --noEmit` y `npm run build` pasan sin errores.
+5. QA manual con datos descartables confirma los casos de la Testing Strategy.
+
+## Open Questions
+
+Ninguna — el orden fijo y el manejo de avisos quedaron confirmados por el usuario.
