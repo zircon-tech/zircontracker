@@ -126,15 +126,24 @@ function parseClockifyCsv(buffer: ArrayBuffer): ParsedTimeEntry[] {
 }
 
 // ─── SCC Excel Parsing ───────────────────────────────────────────────────────
+//
+// Two SCC templates circulate: an older per-resource "grid" file (one person
+// per file, hours laid out on a fixed day×month grid) and a newer
+// "summary" file (one row per consultant, with a single monthly
+// "Working days" total instead of a day-by-day breakdown). parseSccExcel
+// detects which one it's looking at and dispatches accordingly — both
+// return the same shape so the rest of the component doesn't need to care.
 
-async function parseSccExcel(
-  buffer: ArrayBuffer,
-  year: number,
-  projectName: string
-): Promise<{ entries: ParsedTimeEntry[]; resourceName: string }> {
-  const XLSX = await import('xlsx')
-  const wb = XLSX.read(new Uint8Array(buffer), { type: 'array' })
-  const ws = wb.Sheets[wb.SheetNames[0]]
+interface ParsedScc {
+  entries: ParsedTimeEntry[]
+  resourceNames: string[]
+  warnings: string[]
+}
+
+// Grid format: resource name hardcoded at A7, hours on a fixed day×month
+// grid (rows 10–40 "Working Days", rows 45–75 "Extra Hours", columns B–M =
+// Jan–Dec). No header row to detect — this is the original/legacy template.
+function parseSccExcelGrid(ws: XLSXWorkSheet, year: number, projectName: string): ParsedScc {
   const resourceName = ((ws['A7']?.v as string) ?? '').trim()
   const cols = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M']
   const dayEntries = new Map<string, ParsedTimeEntry>()
@@ -172,7 +181,105 @@ async function parseSccExcel(
     }
   }
 
-  return { entries: Array.from(dayEntries.values()), resourceName }
+  if (!resourceName) {
+    throw new Error('No se reconoce el formato de este archivo Excel.')
+  }
+
+  return { entries: Array.from(dayEntries.values()), resourceNames: [resourceName], warnings: [] }
+}
+
+// Summary format: one row per consultant, "Working days" is a single
+// monthly total (not per-day) — there's no cell telling us WHICH days were
+// worked, so we fill the first N business days of the selected month.
+// Extra Hours / On-call columns are intentionally not imported yet.
+function parseSccExcelSummary(
+  rows: string[][],
+  headerRowIdx: number,
+  nameColIdx: number,
+  workingDaysColIdx: number,
+  year: number,
+  month: number, // 1-12
+  projectName: string
+): ParsedScc {
+  const businessDays: string[] = []
+  const daysInMonth = new Date(year, month, 0).getDate()
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dow = new Date(year, month - 1, day).getDay()
+    if (dow === 0 || dow === 6) continue
+    businessDays.push(new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).toISOString())
+  }
+
+  const entries: ParsedTimeEntry[] = []
+  const resourceNames: string[] = []
+  const warnings: string[] = []
+
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i]
+    if (!row || row.every((c) => String(c).trim() === '')) break // first fully-blank row ends the data block
+
+    const rawName = String(row[nameColIdx] ?? '').trim()
+    const resourceName = rawName.replace(/^TBC:?\s*/i, '').trim()
+    const workingDaysRaw = row[workingDaysColIdx]
+    const workingDays = Number(workingDaysRaw)
+
+    if (!resourceName) {
+      warnings.push(`Fila ${i + 1}: sin nombre, se saltea`)
+      continue
+    }
+    if (!workingDaysRaw || isNaN(workingDays) || workingDays <= 0) {
+      warnings.push(`Fila ${i + 1} (${resourceName}): "Working days" inválido o vacío, se saltea`)
+      continue
+    }
+
+    resourceNames.push(resourceName)
+    const daysToFill = Math.min(Math.round(workingDays), businessDays.length)
+    if (daysToFill < workingDays) {
+      warnings.push(`${resourceName}: ${workingDays} días superan los ${businessDays.length} días hábiles del mes — se cargaron ${daysToFill}`)
+    }
+    for (let d = 0; d < daysToFill; d++) {
+      entries.push({ resourceName, projectName, date: businessDays[d], hours: 8, entryType: 'regular' })
+    }
+  }
+
+  return { entries, resourceNames: Array.from(new Set(resourceNames)), warnings }
+}
+
+type XLSXWorkSheet = ReturnType<typeof import('xlsx').read>['Sheets'][string]
+
+async function parseSccExcel(
+  buffer: ArrayBuffer,
+  year: number,
+  month: number,
+  projectName: string
+): Promise<ParsedScc> {
+  const XLSX = await import('xlsx')
+  const wb = XLSX.read(new Uint8Array(buffer), { type: 'array' })
+  const ws = wb.Sheets[wb.SheetNames[0]]
+
+  // Look for a "summary" header row (has both a "Name" and a "Working day(s)"
+  // column) in the first ~25 rows — real files can have instructional/title
+  // rows above the actual header. If none is found, this is the older grid
+  // format instead.
+  const rows: string[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+  let headerRowIdx = -1
+  let nameColIdx = -1
+  let workingDaysColIdx = -1
+  for (let r = 0; r < Math.min(25, rows.length); r++) {
+    const cells = rows[r].map((c) => String(c).trim().toLowerCase())
+    const nIdx = cells.findIndex((c) => c === 'name')
+    const wIdx = cells.findIndex((c) => c.includes('working day'))
+    if (nIdx !== -1 && wIdx !== -1) {
+      headerRowIdx = r
+      nameColIdx = nIdx
+      workingDaysColIdx = wIdx
+      break
+    }
+  }
+
+  if (headerRowIdx !== -1) {
+    return parseSccExcelSummary(rows, headerRowIdx, nameColIdx, workingDaysColIdx, year, month, projectName)
+  }
+  return parseSccExcelGrid(ws, year, projectName)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -328,8 +435,9 @@ function ClockifyImport() {
 function SccExcelImport() {
   const fileRef = useRef<HTMLInputElement>(null)
   const [year, setYear] = useState(new Date().getFullYear())
+  const [month, setMonth] = useState(new Date().getMonth() + 1)
   const [projectName, setProjectName] = useState('')
-  const [parsed, setParsed] = useState<{ entries: ParsedTimeEntry[]; resourceName: string } | null>(null)
+  const [parsed, setParsed] = useState<ParsedScc | null>(null)
   const [fileName, setFileName] = useState('')
   const [parsing, setParsing] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -355,14 +463,14 @@ function SccExcelImport() {
     setParsing(true)
     try {
       const buf = await file.arrayBuffer()
-      const data = await parseSccExcel(buf, year, projectName)
+      const data = await parseSccExcel(buf, year, month, projectName)
       setParsed(data)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Error al parsear el archivo')
     } finally {
       setParsing(false)
     }
-  }, [year, projectName])
+  }, [year, month, projectName])
 
   const handleImport = async () => {
     if (!parsed) return
@@ -393,7 +501,7 @@ function SccExcelImport() {
         <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Excel (.xlsx)</span>
       </div>
 
-      {/* Year + Project selectors */}
+      {/* Year + Month + Project selectors */}
       <div className="flex flex-wrap gap-3">
         <div className="flex flex-col gap-1">
           <label className="text-xs text-gray-500 font-medium">Año</label>
@@ -405,6 +513,18 @@ function SccExcelImport() {
             onChange={(e) => { setYear(Number(e.target.value)); setParsed(null) }}
             className="border border-gray-300 rounded px-3 py-1.5 text-sm w-24"
           />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-gray-500 font-medium" title="Solo se usa para el formato resumen (un total mensual de días trabajados)">Mes</label>
+          <select
+            value={month}
+            onChange={(e) => { setMonth(Number(e.target.value)); setParsed(null) }}
+            className="border border-gray-300 rounded px-3 py-1.5 text-sm w-32"
+          >
+            {['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'].map((m, i) => (
+              <option key={m} value={i + 1}>{m}</option>
+            ))}
+          </select>
         </div>
         <div className="flex flex-col gap-1 flex-1 min-w-48">
           <label className="text-xs text-gray-500 font-medium">Proyecto</label>
@@ -444,8 +564,22 @@ function SccExcelImport() {
           <div className="flex items-center gap-2 text-sm text-gray-600 flex-wrap">
             <FileText size={16} className="text-green-500" />
             <span className="font-medium">{fileName}</span>
-            <span className="text-gray-400">• Recurso: <strong>{parsed.resourceName}</strong></span>
+            <span className="text-gray-400">
+              • {parsed.resourceNames.length === 1
+                ? <>Recurso: <strong>{parsed.resourceNames[0]}</strong></>
+                : <>Personas: <strong>{parsed.resourceNames.length}</strong></>}
+            </span>
           </div>
+          {parsed.warnings.length > 0 && (
+            <div className="bg-yellow-50 border border-yellow-200 rounded p-3 space-y-1">
+              <div className="flex items-center gap-1 text-yellow-700 font-medium text-sm">
+                <AlertTriangle size={14} /> Avisos
+              </div>
+              {parsed.warnings.map((w, i) => (
+                <p key={i} className="text-yellow-800 text-xs">{w}</p>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             {[
               { label: 'Total entradas', value: parsed.entries.length.toLocaleString() },
