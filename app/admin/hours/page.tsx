@@ -1542,7 +1542,7 @@ type Tab = 'import' | 'table' | 'summary' | 'charts'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'import',  label: 'Importar' },
-  { key: 'table',   label: 'Tabla' },
+  { key: 'table',   label: 'Registros' },
   { key: 'summary', label: 'Resumen' },
   { key: 'charts',  label: 'Gráficos' },
 ]
