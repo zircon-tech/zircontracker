@@ -1376,3 +1376,58 @@ descartables:
 ## Open Questions
 
 Ninguna — el orden fijo y el manejo de avisos quedaron confirmados por el usuario.
+
+---
+
+# Spec: Nueva sección "Facturación" en el menú
+
+## Objective
+
+El bloque "Info para invoicing" vive hoy dentro de Reporte de Horas > Importar, mezclado con los
+importadores de horas. El usuario quiere una opción de menú propia, al final, llamada
+"Facturación", y que esa funcionalidad se mude ahí.
+
+**Éxito** = el menú de Administración tiene una última entrada "Facturación" que lleva a una
+página nueva con el mismo bloque de "Info para invoicing" (selector de mes, previsualización,
+avisos, descarga) que hoy está en Reporte de Horas — y ya no está en Reporte de Horas.
+
+## Decisiones (sin ambigüedad, no requirió preguntas)
+
+1. Nueva ruta `/admin/billing`, protegida igual que el resto de `/admin/*` (el middleware ya exige
+   rol admin para cualquier ruta bajo `/admin`, sin cambios ahí).
+2. Entrada nueva al final de `ADMIN_ITEMS` en `components/layout/Sidebar.tsx` (después de "Control
+   de Horas"), label "Facturación", ícono `Receipt` de `lucide-react` (nuevo import).
+3. El componente `InvoicingReportExport` (y sus tipos `InvoicingRow`/`InvoicingCol`/
+   `InvoicingPreview`) se mueven tal cual de `app/admin/hours/page.tsx` a la nueva página — se
+   elimina el bloque y su bloque `<div className="border-t ...">` contenedor de
+   `TabImport` en Reporte de Horas.
+
+## Project Structure
+
+- `app/admin/billing/page.tsx` (nuevo) — página mínima: título "Facturación" + `<InvoicingReportExport />`.
+- `app/admin/hours/page.tsx` — se quita el bloque "4. Invoicing report export" de `TabImport` y se
+  quita la función `InvoicingReportExport` (se muda entera a la página nueva).
+- `components/layout/Sidebar.tsx` — nueva entrada en `ADMIN_ITEMS`.
+
+## Boundaries
+
+- **Never**: tocar `/api/reports/invoicing` ni `/api/reports/invoicing/export` — el backend no
+  cambia, solo dónde vive el botón en el frontend.
+
+## Testing Strategy
+
+`npx tsc --noEmit` + `npm run build` + verificación visual en el browser: la nueva entrada
+"Facturación" aparece al final del menú Administración, lleva a `/admin/billing`, el bloque
+funciona igual que antes (previsualización + avisos + descarga), y ya no aparece en Reporte de
+Horas > Importar.
+
+## Success Criteria
+
+1. "Facturación" aparece como última entrada del menú Administración.
+2. `/admin/billing` muestra el mismo flujo de previsualización/descarga que antes.
+3. El bloque ya no está en Reporte de Horas.
+4. `npx tsc --noEmit` y `npm run build` pasan sin errores.
+
+## Open Questions
+
+Ninguna.
