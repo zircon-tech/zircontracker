@@ -4,11 +4,14 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireAdmin } from '@/lib/auth'
 import { INVOICING_PROJECT_ORDER, INVOICING_RESOURCE_ORDER, resolveInvoicingOrder } from '@/lib/invoicing-report'
+import { computeInvoice, computedRowsToCells, type LineState } from '@/lib/invoice-sheet'
 
 // Generates the final .xlsx for the monthly "Info para invoicing" report,
 // scoped to exactly the resource/project labels the admin confirmed in the
 // preview (app/api/reports/invoicing/route.ts) — anything they unchecked
 // there (no match in the DB, or no hours that month) is left out here.
+// When `invoiceLines` is sent (the edited state of the "Facturas" preview), a
+// second sheet "Facturas" is added, with live formulas in the Total column.
 export async function POST(req: NextRequest) {
   try {
     await requireAdmin()
@@ -76,6 +79,24 @@ export async function POST(req: NextRequest) {
   const ws = XLSX.utils.aoa_to_sheet(rows)
   const wb = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(wb, ws, 'Info para invoicing')
+
+  const invoiceLines: Record<string, LineState> | undefined = body.invoiceLines
+  if (invoiceLines) {
+    const cells = computedRowsToCells(computeInvoice(invoiceLines))
+    const sheet: Record<string, unknown> = {}
+    cells.forEach((rowCells, r) => {
+      rowCells.forEach((cell, c) => {
+        if (cell.v === undefined) return
+        const ref = XLSX.utils.encode_cell({ r, c })
+        if (typeof cell.v === 'number') sheet[ref] = cell.f ? { t: 'n', v: cell.v, f: cell.f } : { t: 'n', v: cell.v }
+        else sheet[ref] = { t: 's', v: cell.v }
+      })
+    })
+    sheet['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: Math.max(cells.length - 1, 0), c: 5 } })
+    sheet['!cols'] = [{ wch: 5 }, { wch: 95 }, { wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 34 }]
+    XLSX.utils.book_append_sheet(wb, sheet as import('xlsx').WorkSheet, 'Facturas')
+  }
+
   const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer
 
   return new Response(new Uint8Array(buffer), {

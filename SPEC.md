@@ -1431,3 +1431,143 @@ Horas > Importar.
 ## Open Questions
 
 Ninguna.
+
+---
+
+# Spec: Hoja de facturas por cliente ("Info para invoicing" → hoja del contador)
+
+## Objective
+
+Cada mes, para pasarle los datos al contador, el usuario arma a mano en Google Sheets una **hoja de
+facturas por cliente** (además del pivot Recurso×Proyecto, que ya se genera desde `/admin/billing`).
+Quiere que ZirconTracker la genere sola, con un preview para ajustar antes de bajarla.
+
+**Éxito** = en `/admin/billing`, elegir un mes → ver un preview del pivot **y** de la hoja de facturas
+(cliente → líneas con Precio, Horas, Total y comentario), ajustar lo que haga falta → descargar un
+único `.xlsx` con las dos hojas del mes (pivot + facturas), listo para subir a Google Sheets.
+
+## Hallazgos clave (lectura de la planilla compartida, vía Drive, solo lectura)
+
+- La planilla tiene ~100 pestañas; cada mes son dos: (a) pivot Recurso×Proyecto (ya implementado) y
+  (b) la **hoja de facturas** (título "AGREGAR NUEVOS COMENTARIOS EN FACTURAS"). El link no indica qué
+  pestaña es (`gid`), pero el usuario confirmó que es la (b).
+- Estructura de (b): bloques por cliente (Infogain, Infinite, Hover, Suku, IMOUY, Ideal Protein, Cash,
+  Smartway, MOB, Claldy). Cada bloque: fila de encabezado (`OK | <Cliente> | Precio/Rate | Horas/Days |
+  Total`), líneas `<texto fiscal> - <rol> - <persona> | precio | horas | total | comentario`, y una fila
+  de total del cliente. Total de línea = precio × horas. Comentarios tipo "Sin iva, hay que sumar iva",
+  "IVA incluído", "Ajustarlo según salario real".
+- Las **horas de cada línea son las del pivot** (p.ej. mes anterior: Luciana Diniz→Infogain 168,
+  Abdulelah→Suku 168, Ideal Protein 168). Hay un texto fiscal por tipo de servicio ("Servicios
+  exonerados literal S Art 66 T4 T.O 2023" / "…artículo 52 Titulo 4").
+- IMOUY se factura por **días** (Rate 240 × Days), no por horas. Hay líneas sin horas del sistema
+  ("Hiring fee" 3750, "Claude Code Licences" 50×2).
+- Bloques que en los últimos meses están en 0/vacíos: Infinite (con subtotales Total Development/
+  Testing/General y Descuento 20%), Hover, Cash y Smartway ("ingresos gravados IRAE").
+
+## Decisiones confirmadas con el usuario
+
+1. Es la hoja de facturas por cliente.
+2. **Plantilla fija en código, editable en el preview**: bloques, líneas, texto fiscal, precios y
+   comentarios viven en un archivo del repo (mismo criterio que `lib/invoicing-report.ts`); en el
+   preview se puede ajustar por línea (precio, horas, persona) solo para ese mes. Cambios permanentes =
+   tocar el código. Sin tablas nuevas en la base.
+3. **Las horas de cada línea salen de las horas cargadas de la persona** en el proyecto del cliente
+   (misma fuente que el pivot). En el preview cada línea tiene un selector de persona para elegir/cambiar
+   quién va en esa línea; al cambiarla se recalculan horas y total.
+4. **El `.xlsx` descargado trae las dos hojas del mes**: "Info para invoicing" (pivot, sin cambios) y
+   "Facturas".
+
+## Tech Stack
+
+Next.js 14 App Router, TypeScript, Prisma + Turso, `xlsx` (SheetJS, ya usado en el export del pivot).
+
+## Project Structure
+
+- `lib/invoice-sheet.ts` (nuevo) — plantilla `INVOICE_SHEET_TEMPLATE`: array de bloques `{ client,
+  unit: 'Horas' | 'Días', projectLookupNames, lines: [{ description, rate, defaultResourceLookup,
+  comment }] }` + helpers puros para armar las filas de la hoja (total de línea, total de cliente).
+- Refactor chico: extraer de `app/api/reports/invoicing/route.ts` la lógica de horas por
+  (recurso, proyecto) a una función compartida en `lib/invoicing-report.ts` (o un archivo hermano) para
+  que pivot y facturas usen exactamente los mismos números. El comportamiento del pivot no cambia.
+- `app/api/reports/invoice-sheet/route.ts` (nuevo, `GET ?month=YYYY-MM`, admin-only) — devuelve la
+  plantilla resuelta contra la base: por línea, persona por defecto resuelta, horas, total, y una matriz
+  `hoursByResourceProject` de los proyectos de clientes para que el preview recalcule al cambiar de
+  persona sin más requests, más avisos (persona/proyecto sin match o sin horas ese mes).
+- `app/api/reports/invoicing/export/route.ts` — se extiende (body con el estado final editado de las
+  líneas) para devolver un `.xlsx` de dos hojas. Si no llega el estado de facturas, sigue devolviendo solo
+  el pivot (compatibilidad).
+- `app/admin/billing/page.tsx` — un solo flujo: selector de mes → "Generar previsualización" → sección
+  pivot (la actual, con sus avisos/checkboxes) + sección "Facturas por cliente" (tabla por bloque con
+  selector de persona, precio y horas editables, total recalculado, comentario) → "Descargar .xlsx".
+
+## Code Style
+
+Reusar `SearchableSelect` para el selector de persona, el patrón de avisos con `AlertTriangle`/
+checkboxes del preview del pivot, y `formatHours`. Funciones de cálculo puras en `lib/` (sin fetch).
+
+## Testing Strategy
+
+Sin suite automatizada — `npx tsc --noEmit` + `npm run build` + QA manual contra la base real (solo
+lectura; el flujo no escribe en la base), mes con datos (agosto 2026):
+- Horas por línea = horas del pivot para esa persona/proyecto; total = precio × horas; total de cliente =
+  suma de líneas.
+- Cambiar la persona de una línea recalcula horas y total; editar precio/horas también.
+- Persona/proyecto sin match o sin horas → aviso, sin romper el resto.
+- El `.xlsx` abre con las dos hojas y los mismos números que el preview.
+
+## Boundaries
+
+- **Always**: mismos números que el pivot (misma consulta/función); todo admin-only; solo lectura sobre
+  la base.
+- **Ask first**: si hay que persistir precios/líneas en la base (hoy no), o incorporar los bloques
+  dormidos con lógica propia (Infinite: subtotales y descuento).
+- **Never**: escribir en la base desde este flujo; cambiar el comportamiento actual del pivot.
+
+## Success Criteria
+
+1. El preview muestra la hoja de facturas del mes con horas y totales coherentes con el pivot.
+2. Se puede cambiar persona/precio/horas por línea y los totales se recalculan.
+3. El `.xlsx` trae "Info para invoicing" y "Facturas" con lo mismo que el preview.
+4. `npx tsc --noEmit` y `npm run build` pasan.
+
+## Decisiones adicionales confirmadas (segunda ronda)
+
+- Líneas sin horas del sistema (Hiring fee, Claude Code Licences): línea con **cantidad editable** en el
+  preview (default de la plantilla: Hiring fee 0, Licences 2) y su comentario original.
+- **Los bloques dormidos SE INCLUYEN** (Infinite con sus subtotales y descuento, Hover, Cash, Smartway),
+  con la misma estructura y fórmulas que la hoja actual. Los que no tienen proyecto/persona en la base
+  (p.ej. Infinite, Federico Alvarez) quedan como líneas manuales editables con aviso.
+- **Horas siempre enteras**: cada línea usa `Math.round(horas del pivot)` (p.ej. 167.7 → 168, como en la
+  hoja vieja). El total de línea usa el entero.
+- IMOUY por días = horas del pivot ÷ 8 (Rate 240). Proyecto por cliente: Suku → "Suku 2024", IMOUY →
+  "EG+", MOB → "MOB Mantenimiento", resto mismo nombre (mismas columnas del pivot).
+
+## Fórmulas de la columna Total (leídas de la pestaña "Invoicing August 2026", solo lectura)
+
+El `.xlsx` generado debe llevar **fórmulas vivas** (no solo valores) en la hoja "Facturas", con el valor
+calculado cacheado, para que se comporte igual que la planilla actual al subirla a Google Sheets:
+
+| Caso | Fórmula real de la hoja |
+|---|---|
+| Total de línea (todas) | `E = C * D` (precio × horas/días) |
+| Subtotal Infogain "Sin iva" | `E10 = SUM(E7:E9)` |
+| Infogain "IVA incluído" | `E11 = E10 * 1.22` (IVA 22%) |
+| Suku / Ideal Protein / MOB / Claldy: total del cliente | `SUM` del rango de líneas (p.ej. `E39 = SUM(E34:E38)`, `E53 = SUM(E50:E52)`) |
+| Suku: total de horas | `D39 = SUM(D34:D38)` |
+| Hiring fee (precio) | `C38 = 5000*1.5/2` = 3750 ("Ajustarlo según salario real") |
+| Infinite | `D17/E17 = SUM` de Development; `E20 = SUM(E19)` Testing; `E22 = E20 + E17` Total General; `E24 = E22 - D24` Descuento (C24 = 20) |
+| Hover | `D30 = SUM(D28:D29)`, `E30 = SUM(E28:E29)`, `F30 = E30 / D30` (tarifa promedio) |
+
+- Observación: en IMOUY la fila `E47 = SUM(#REF!)` está rota en la hoja actual (error `#REF!`). No se
+  replica el error: el total del bloque IMOUY = suma de sus líneas.
+- Las **horas (D) en la hoja actual son valores tipeados a mano** (no fórmulas hacia el pivot): las
+  reemplaza el cálculo automático (redondeado a entero).
+- La plantilla de `lib/invoice-sheet.ts` describe cada fila con su tipo (`line`, `subtotal`, `vat`,
+  `total`, `text`) y el armado del `.xlsx` calcula los números de fila para generar las fórmulas con las
+  referencias correctas; el preview calcula los mismos totales en pantalla.
+
+## Open Questions (residuales, no bloquean)
+
+1. Proyecto de los bloques sin equivalente claro en la base (Infinite, Hover, Cash): supuesto = líneas
+   manuales editables con aviso, hasta que digas a qué proyecto corresponden.
+2. `E24 = E22 - D24` (Descuento de Infinite): se replica tal cual; D24 queda editable (vacío = 0).
